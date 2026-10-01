@@ -21,8 +21,6 @@ FEATURES = [
     "route_hist_median",
 ]
 
-BASE_FEATURES = FEATURES[:-1]
-
 TARGET = "posted_rate"
 
 NUMERIC_FEATURES = [
@@ -53,7 +51,11 @@ def make_route_key(df):
 def make_model():
     preprocessor = ColumnTransformer(
         transformers=[
-            ("num", "passthrough", NUMERIC_FEATURES),
+            (
+                "num",
+                "passthrough",
+                NUMERIC_FEATURES,
+            ),
             (
                 "cat",
                 OneHotEncoder(
@@ -83,9 +85,15 @@ def make_model():
 
 def add_date_columns(df):
     df = df.copy()
-    df["date_dt"] = pd.to_datetime(df["date"]).dt.normalize()
+
+    df["date_dt"] = pd.to_datetime(
+        df["date"]
+    ).dt.normalize()
+
     df["month"] = df["date_dt"].dt.month
+
     df["route_key"] = make_route_key(df)
+
     return df
 
 
@@ -95,32 +103,29 @@ def build_strict_temporal_history_features(
     global_median,
 ):
     """
-    Build route historical medians using only observations strictly
-    earlier than each target row's date.
+    Build route historical medians using only observations
+    strictly earlier than each target row's date.
 
-    For target rows sharing the same date, the history available to all
-    of them is the history from dates strictly before that date.
+    For target rows sharing the same date, the history available
+    to all of them is the history from dates strictly before that
+    date.
+
+    No same-day or future observations are used.
     """
 
     history = history_df.copy()
     target = target_df.copy()
 
-    history["date_dt"] = pd.to_datetime(history["date"]).dt.normalize()
-    target["date_dt"] = pd.to_datetime(target["date"]).dt.normalize()
+    history["date_dt"] = pd.to_datetime(
+        history["date"]
+    ).dt.normalize()
+
+    target["date_dt"] = pd.to_datetime(
+        target["date"]
+    ).dt.normalize()
 
     history["route_key"] = make_route_key(history)
     target["route_key"] = make_route_key(target)
-
-    history = history.sort_values("date_dt")
-
-    route_history = {}
-
-    for route, group in history.groupby("route_key", sort=False):
-        route_history[route] = (
-            group.groupby("date_dt")[TARGET]
-            .median()
-            .sort_index()
-        )
 
     result = []
 
@@ -128,13 +133,10 @@ def build_strict_temporal_history_features(
         route = row["route_key"]
         current_date = row["date_dt"]
 
-        route_dates = route_history.get(route)
-
-        if route_dates is None:
-            result.append(global_median)
-            continue
-
-        prior = route_dates[route_dates.index < current_date]
+        prior = history[
+            (history["route_key"] == route)
+            & (history["date_dt"] < current_date)
+        ][TARGET]
 
         if len(prior) == 0:
             result.append(global_median)
@@ -149,7 +151,9 @@ def build_strict_temporal_history_features(
 def train_final_model(dev):
     dev = add_date_columns(dev)
 
-    global_median = float(dev[TARGET].median())
+    global_median = float(
+        dev[TARGET].median()
+    )
 
     enriched_dev = build_strict_temporal_history_features(
         dev,
@@ -157,35 +161,54 @@ def train_final_model(dev):
         global_median,
     )
 
-    # The historical feature for each training row must not use the
-    # current day's target. The function above enforces date < current date.
-
+    # The historical route feature for each training row
+    # uses only observations from strictly earlier dates.
     X = enriched_dev[FEATURES]
-    y = np.log1p(dev[TARGET].astype(float))
+
+    y = np.log1p(
+        dev[TARGET].astype(float)
+    )
 
     model = make_model()
+
     model.fit(X, y)
 
     return model, global_median
 
 
-def prepare_validation(dev, validation, global_median):
-    validation = add_date_columns(validation)
+def prepare_validation(
+    dev,
+    validation,
+    global_median,
+):
+    validation = add_date_columns(
+        validation
+    )
 
-    validation = build_strict_temporal_history_features(
-        dev,
-        validation,
-        global_median,
+    validation = (
+        build_strict_temporal_history_features(
+            dev,
+            validation,
+            global_median,
+        )
     )
 
     return validation
 
 
-def prepare_december_predictions(dev, december, global_median):
+def prepare_december_predictions(
+    dev,
+    december,
+    global_median,
+):
     december = december.copy()
-    december["date_dt"] = pd.to_datetime(december["date"]).dt.normalize()
 
-    # Recover the unique coordinate representation of the requested route
+    december["date_dt"] = pd.to_datetime(
+        december["date"]
+    ).dt.normalize()
+
+    # Recover the unique coordinate representation
+    # of the requested Lexington -> Fort Wayne route.
     route_rows = dev[
         (dev["pickup"] == "Lexington")
         & (dev["delivery"] == "Fort Wayne")
@@ -193,7 +216,8 @@ def prepare_december_predictions(dev, december, global_median):
 
     if len(route_rows) == 0:
         raise ValueError(
-            "No historical Lexington -> Fort Wayne route found in training data."
+            "No historical Lexington -> Fort Wayne "
+            "route found in training data."
         )
 
     pickup_coords = route_rows[
@@ -206,26 +230,41 @@ def prepare_december_predictions(dev, december, global_median):
 
     if len(pickup_coords) != 1:
         raise ValueError(
-            "Expected exactly one unique pickup coordinate pair."
+            "Expected exactly one unique "
+            "pickup coordinate pair."
         )
 
     if len(delivery_coords) != 1:
         raise ValueError(
-            "Expected exactly one unique delivery coordinate pair."
+            "Expected exactly one unique "
+            "delivery coordinate pair."
         )
 
-    pickup_lat = float(pickup_coords.iloc[0]["pickup_lat"])
-    pickup_lon = float(pickup_coords.iloc[0]["pickup_lon"])
+    pickup_lat = float(
+        pickup_coords.iloc[0]["pickup_lat"]
+    )
 
-    delivery_lat = float(delivery_coords.iloc[0]["delivery_lat"])
-    delivery_lon = float(delivery_coords.iloc[0]["delivery_lon"])
+    pickup_lon = float(
+        pickup_coords.iloc[0]["pickup_lon"]
+    )
+
+    delivery_lat = float(
+        delivery_coords.iloc[0]["delivery_lat"]
+    )
+
+    delivery_lon = float(
+        delivery_coords.iloc[0]["delivery_lon"]
+    )
 
     december["pickup_lat"] = pickup_lat
     december["pickup_lon"] = pickup_lon
+
     december["delivery_lat"] = delivery_lat
     december["delivery_lon"] = delivery_lon
 
-    december["route_key"] = make_route_key(december)
+    december["route_key"] = make_route_key(
+        december
+    )
 
     route_key = make_route_key(
         pd.DataFrame(
@@ -242,12 +281,18 @@ def prepare_december_predictions(dev, december, global_median):
         dev["route_key"] == route_key
     ].copy()
 
+    # December starts after the development period,
+    # so only historical observations before December
+    # are allowed to contribute.
     historical_route = historical_route[
-        historical_route["date_dt"] < december["date_dt"].min()
+        historical_route["date_dt"]
+        < december["date_dt"].min()
     ]
 
     if len(historical_route) == 0:
-        december["route_hist_median"] = global_median
+        december["route_hist_median"] = (
+            global_median
+        )
     else:
         december["route_hist_median"] = float(
             historical_route[TARGET].median()
@@ -259,33 +304,65 @@ def prepare_december_predictions(dev, december, global_median):
 def main(data_dir, output_dir):
     data_dir = Path(data_dir)
     output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
 
-    train_path = data_dir / "train-test.csv"
-    validation_path = data_dir / "validation.csv"
-    december_path = data_dir / "december-chart-inputs.csv"
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    for path in [train_path, validation_path, december_path]:
+    train_path = (
+        data_dir / "train-test.csv"
+    )
+
+    validation_path = (
+        data_dir / "validation.csv"
+    )
+
+    december_path = (
+        data_dir / "december-chart-inputs.csv"
+    )
+
+    for path in [
+        train_path,
+        validation_path,
+        december_path,
+    ]:
         if not path.exists():
-            raise FileNotFoundError(f"Missing required file: {path}")
+            raise FileNotFoundError(
+                f"Missing required file: {path}"
+            )
 
     print("=" * 80)
     print("FREIGHT RATE MODEL")
     print("=" * 80)
 
     dev = pd.read_csv(train_path)
-    validation = pd.read_csv(validation_path)
-    december = pd.read_csv(december_path)
+    validation = pd.read_csv(
+        validation_path
+    )
+    december = pd.read_csv(
+        december_path
+    )
 
-    print(f"Development rows: {len(dev):,}")
-    print(f"Validation rows:  {len(validation):,}")
-    print(f"December rows:    {len(december):,}")
+    print(
+        f"Development rows: {len(dev):,}"
+    )
+
+    print(
+        f"Validation rows:  {len(validation):,}"
+    )
+
+    print(
+        f"December rows:    {len(december):,}"
+    )
 
     # ------------------------------------------------------------------
     # FINAL MODEL
     # ------------------------------------------------------------------
 
-    model, global_median = train_final_model(dev)
+    model, global_median = (
+        train_final_model(dev)
+    )
 
     validation_prepared = prepare_validation(
         dev,
@@ -304,13 +381,16 @@ def main(data_dir, output_dir):
 
     validation_output = pd.DataFrame(
         {
-            "load_id": validation["load_id"].values,
+            "load_id": validation[
+                "load_id"
+            ].values,
             "predicted_rate": predictions,
         }
     )
 
     validation_output_path = (
-        output_dir / "validation_predictions.csv"
+        output_dir
+        / "validation_predictions.csv"
     )
 
     validation_output.to_csv(
@@ -319,7 +399,7 @@ def main(data_dir, output_dir):
     )
 
     print(
-        f"Validation predictions saved: "
+        "Validation predictions saved: "
         f"{validation_output_path}"
     )
 
@@ -327,12 +407,16 @@ def main(data_dir, output_dir):
     # DECEMBER PREDICTIONS
     # ------------------------------------------------------------------
 
-    dev_for_december = add_date_columns(dev)
+    dev_for_december = add_date_columns(
+        dev
+    )
 
-    december_prepared = prepare_december_predictions(
-        dev_for_december,
-        december,
-        global_median,
+    december_prepared = (
+        prepare_december_predictions(
+            dev_for_december,
+            december,
+            global_median,
+        )
     )
 
     december_predictions = np.maximum(
@@ -345,10 +429,14 @@ def main(data_dir, output_dir):
     )
 
     december_output = december.copy()
-    december_output["predicted_rate"] = december_predictions
+
+    december_output[
+        "predicted_rate"
+    ] = december_predictions
 
     december_output_path = (
-        output_dir / "december-chart-inputs.csv"
+        output_dir
+        / "december-chart-inputs.csv"
     )
 
     december_output.to_csv(
@@ -357,18 +445,24 @@ def main(data_dir, output_dir):
     )
 
     print(
-        f"December predictions saved: "
+        "December predictions saved: "
         f"{december_output_path}"
     )
 
     print("\nPrediction summary:")
+
     print(
-        pd.Series(predictions).describe()
+        pd.Series(
+            predictions
+        ).describe()
     )
 
     print("\nDecember prediction:")
+
     print(
-        pd.Series(december_predictions).describe()
+        pd.Series(
+            december_predictions
+        ).describe()
     )
 
     print("\nCOMPLETE")
@@ -380,13 +474,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data-dir",
         default="data",
-        help="Directory containing assessment CSV files.",
+        help=(
+            "Directory containing "
+            "assessment CSV files."
+        ),
     )
 
     parser.add_argument(
         "--output-dir",
         default="outputs",
-        help="Directory for generated predictions.",
+        help=(
+            "Directory for generated "
+            "predictions."
+        ),
     )
 
     args = parser.parse_args()
